@@ -17,9 +17,17 @@
 #define FONT_SIZE 69
 
 #define RENDER_FPS 60
+#define VIZ_ANIM_TIME 1.5f
 #define RENDER_FACTOR 120
 #define RENDER_WIDTH (16*RENDER_FACTOR)
 #define RENDER_HEIGHT (9*RENDER_FACTOR)
+
+typedef enum {
+    NoViz         = 1 << 0,
+    FFTLines      = 1 << 1,
+    CircularLines = 1 << 2,
+    ConectedLine  = 1 << 3
+} VizualizationTypes;
 
 typedef struct {
     char *file_path;
@@ -29,6 +37,11 @@ typedef struct {
     int circle_radius_location;
     int circle_power_location;
     bool error;
+    
+    VizualizationTypes vizualization_type;
+    bool is_merge_viz;
+    float t_val;
+    VizualizationTypes viz_type_from;
 
     bool rendering;
     RenderTexture2D screen;
@@ -140,29 +153,82 @@ size_t fft_analyze(float dt)
     return m;
 }
 
-void fft_render(size_t w, size_t h, size_t m)
+Vector2 getPlanarFromPolarValues(size_t w, size_t h, float line_length, float angle_on_circle) {
+    return (Vector2){
+        w / 2.0 + line_length * cos(angle_on_circle * 2*PI + 2.0f/3.0f * PI),
+        h / 2.0 + line_length * sin(angle_on_circle * 2*PI + 2.0f/3.0f * PI)
+    };
+}
+
+void getPointsForLines(Vector2* startPos, Vector2* endPos, size_t w, size_t h, float cell_width, size_t i, float maxOverallHeightFactor, float startOffset, float minHeight, float hue, float t, VizualizationTypes viz_type)
 {
+  if (viz_type & CircularLines) {
+    *startPos = getPlanarFromPolarValues(w, h, h * maxOverallHeightFactor * (startOffset), hue);
+    *endPos   = getPlanarFromPolarValues(w, h, h * maxOverallHeightFactor * (t + startOffset + minHeight), hue);
+  }
+  if (viz_type & FFTLines) {
+    *startPos = (Vector2){
+        i*cell_width + cell_width/2,
+        h - h*2/3*t,
+    };
+    *endPos = (Vector2){
+        i*cell_width + cell_width/2,
+        h,
+    };
+  }
+}
+
+void getPointsForCircles(Vector2* center, size_t w, size_t h, float cell_width, size_t i, float maxOverallHeightFactor, float startOffset, float minHeight, float hue, float t, VizualizationTypes viz_type)
+{
+  if (viz_type & CircularLines || viz_type & ConectedLine) {
+    *center = getPlanarFromPolarValues(w, h, h * maxOverallHeightFactor * (startOffset), hue);
+  }
+  if (viz_type & FFTLines) {
+    *center = (Vector2){
+        i*cell_width + cell_width/2,
+        h - h*2/3*t,
+    };
+  }
+}
+
+float lerp(float a, float b, float t)
+{
+    return a * t + b * (1.0f - t);
+}
+
+void fft_render(size_t w, size_t h, size_t m, float dt)
+{
+    plug->t_val = plug->t_val <= 0 ? 0 : plug->t_val - dt * 1.0f/VIZ_ANIM_TIME;
     // The width of a single bar
     float cell_width = (float)w/m;
 
     // Global color parameters
     float saturation = 0.75f;
     float value = 1.0f;
+    
+    float startOffset = 0.2f;
+    float minHeight = 0.1f;
+    float maxOverallHeightFactor = 1/3.f * 0.75f;
 
     // Display the Bars
     for (size_t i = 0; i < m; ++i) {
         float t = out_smooth[i];
         float hue = (float)i/m;
         Color color = ColorFromHSV(hue*360, saturation, value);
-        Vector2 startPos = {
-            i*cell_width + cell_width/2,
-            h - h*2/3*t,
-        };
-        Vector2 endPos = {
-            i*cell_width + cell_width/2,
-            h,
-        };
-        float thick = cell_width/3*sqrtf(t);
+        Vector2 startPos, endPos;
+        getPointsForLines(&startPos, &endPos, w, h, cell_width, i, maxOverallHeightFactor, startOffset, minHeight, hue, t, plug->vizualization_type);
+        if (plug->t_val > 0) {
+            Vector2 startPosFrom, endPosFrom;
+            getPointsForLines(&startPosFrom, &endPosFrom, w, h, cell_width, i, maxOverallHeightFactor, startOffset, minHeight, hue, t, plug->viz_type_from);
+             // using endPosFrom to avoid flipping of the bars since the "origin" for start and end are on opposite sides
+            startPos.x = lerp(endPosFrom.x, startPos.x, plug->t_val);
+            startPos.y = lerp(endPosFrom.y, startPos.y, plug->t_val);
+            
+            endPos.x = lerp(startPosFrom.x, endPos.x, plug->t_val);
+            endPos.y = lerp(startPosFrom.y, endPos.y, plug->t_val);
+        }
+    
+        float thick = cell_width/3 * sqrtf(t);
         DrawLineEx(startPos, endPos, thick, color);
     }
 
@@ -177,37 +243,71 @@ void fft_render(size_t w, size_t h, size_t m)
         float end = out_smooth[i];
         float hue = (float)i/m;
         Color color = ColorFromHSV(hue*360, saturation, value);
-        Vector2 startPos = {
-            i*cell_width + cell_width/2,
-            h - h*2/3*start,
-        };
-        Vector2 endPos = {
-            i*cell_width + cell_width/2,
-            h - h*2/3*end,
-        };
-        float radius = cell_width*3*sqrtf(end);
-        Vector2 origin = {0};
-        if (endPos.y >= startPos.y) {
-            Rectangle dest = {
-                .x = startPos.x - radius/2,
-                .y = startPos.y,
-                .width = radius,
-                .height = endPos.y - startPos.y
+        if (plug->vizualization_type & FFTLines) {
+            if (plug->t_val > 0) {
+                // smears hard to animate :pepe_hands:
+                break;
+            }
+            Vector2 startPos = {
+                i*cell_width + cell_width/2,
+                h - h*2/3*start,
             };
-            Rectangle source = {0, 0, 1, 0.5};
-            DrawTexturePro(texture, source, dest, origin, 0, color);
-        } else {
-            Rectangle dest = {
-                .x = endPos.x - radius/2,
-                .y = endPos.y,
-                .width = radius,
-                .height = startPos.y - endPos.y
+            Vector2 endPos = {
+                i*cell_width + cell_width/2,
+                h - h*2/3*end,
             };
-            Rectangle source = {0, 0.5, 1, 0.5};
-            DrawTexturePro(texture, source, dest, origin, 0, color);
+            float radius = cell_width*3*sqrtf(end);
+            Vector2 origin = {0};
+            if (endPos.y >= startPos.y) {
+                Rectangle dest = {
+                    .x = startPos.x - radius/2,
+                    .y = startPos.y,
+                    .width = radius,
+                    .height = endPos.y - startPos.y
+                };
+                Rectangle source = {0, 0, 1, 0.5};
+                DrawTexturePro(texture, source, dest, origin, 0, color);
+            } else {
+                Rectangle dest = {
+                    .x = endPos.x - radius/2,
+                    .y = endPos.y,
+                    .width = radius,
+                    .height = startPos.y - endPos.y
+                };
+                Rectangle source = {0, 0.5, 1, 0.5};
+                DrawTexturePro(texture, source, dest, origin, 0, color);
+            }
         }
     }
     EndShaderMode();
+
+    // Display the connecting lines
+    for (size_t i = 0; i <= m; ++i) {
+        size_t i2 = i + 1 > m ? 0 : i + 1;
+        float t1 = out_smooth[i];
+        float t2 = out_smooth[i2];
+        float hue1 = (float)i/m;
+        float hue2 = (float)i2/m;
+        Color color = ColorFromHSV(hue1*360, saturation, value);
+        Vector2 startPos, endPos;
+    
+        if (plug->vizualization_type & ConectedLine) {
+            startPos = (Vector2){
+              w / 2.0 + (h*1/3*(t1 + 0.3) + 0) * cos(hue1 * 2*PI),
+              h / 2.0 + (h*1/3*(t1 + 0.3) + 0) * sin(hue1 * 2*PI)
+            };
+            endPos   = (Vector2){
+              w / 2.0 + (h*1/3*(t2 + 0.3) + 0) * cos(hue2 * 2*PI),
+              h / 2.0 + (h*1/3*(t2 + 0.3) + 0) * sin(hue2 * 2*PI)
+            };
+        } else {
+          // for now, untill it could be reused in other vizs
+          break;
+        }
+    
+        float thick = cell_width/3*0.5;
+        DrawLineEx(startPos, endPos, thick, color);
+    }
 
     // Display the Circles
     SetShaderValue(plug->circle, plug->circle_radius_location, (float[1]){ 0.07f }, SHADER_UNIFORM_FLOAT);
@@ -217,10 +317,14 @@ void fft_render(size_t w, size_t h, size_t m)
         float t = out_smooth[i];
         float hue = (float)i/m;
         Color color = ColorFromHSV(hue*360, saturation, value);
-        Vector2 center = {
-            i*cell_width + cell_width/2,
-            h - h*2/3*t,
-        };
+        Vector2 center;
+        getPointsForCircles(&center, w, h, cell_width, i, maxOverallHeightFactor, startOffset, minHeight, hue, t, plug->vizualization_type);
+        if (plug->t_val > 0) {
+            Vector2 centerFrom;
+            getPointsForCircles(&centerFrom, w, h, cell_width, i, maxOverallHeightFactor, startOffset, minHeight, hue, t, plug->viz_type_from);
+            center.x = lerp(centerFrom.x, center.x, plug->t_val);
+            center.y = lerp(centerFrom.y, center.y, plug->t_val);
+        }
         float radius = cell_width*6*sqrtf(t);
         Vector2 position = {
             .x = center.x - radius,
@@ -265,6 +369,7 @@ void plug_init(void)
     plug->circle_radius_location = GetShaderLocation(plug->circle, "radius");
     plug->circle_power_location = GetShaderLocation(plug->circle, "power");
     plug->screen = LoadRenderTexture(RENDER_WIDTH, RENDER_HEIGHT);
+    plug->vizualization_type = FFTLines;
 }
 
 Plug *plug_pre_reload(void)
@@ -326,9 +431,30 @@ void plug_update(void)
         0x15, 0x15, 0x15, 0xFF
     });
 
+    size_t key_number;
     if (!plug->rendering) {
         if (IsMusicReady(plug->music)) {
             UpdateMusicStream(plug->music);
+            
+            if (IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT) ) {
+                plug->is_merge_viz = true;
+            }
+            
+            if (IsKeyReleased(KEY_LEFT_SHIFT) || IsKeyReleased(KEY_RIGHT_SHIFT)) {
+                plug->is_merge_viz = false;
+            }
+            
+            while ((key_number = GetKeyPressed())) {
+                if (key_number >= KEY_ZERO && key_number <= KEY_NINE) {
+                  if (plug->is_merge_viz) {
+                      plug->vizualization_type ^= 1 << (key_number - KEY_ZERO);
+                  } else {
+                      plug->viz_type_from = plug->vizualization_type;
+                      plug->vizualization_type = 1 << (key_number - KEY_ZERO);
+                      plug->t_val = 1.0f;
+                  }
+                }
+            }
 
             if (IsKeyPressed(KEY_SPACE)) {
                 if (IsMusicStreamPlaying(plug->music)) {
@@ -356,8 +482,9 @@ void plug_update(void)
                 plug->rendering = true;
             }
 
-            size_t m = fft_analyze(GetFrameTime());
-            fft_render(GetRenderWidth(), GetRenderHeight(), m);
+            float dt = GetFrameTime();
+            size_t m = fft_analyze(dt);
+            fft_render(GetRenderWidth(), GetRenderHeight(), m, dt);
         } else {
             const char *label;
             Color color;
@@ -406,11 +533,12 @@ void plug_update(void)
                 plug->wave_cursor += 1;
             }
 
-            size_t m = fft_analyze(1.0f/RENDER_FPS);
+            float dt = 1.0f/RENDER_FPS;
+            size_t m = fft_analyze(dt);
 
             BeginTextureMode(plug->screen);
             ClearBackground(CLITERAL(Color) {0x15, 0x15, 0x15, 0xFF});
-            fft_render(plug->screen.texture.width, plug->screen.texture.height, m);
+            fft_render(plug->screen.texture.width, plug->screen.texture.height, m, dt);
             EndTextureMode();
 
             Image image = LoadImageFromTexture(plug->screen.texture);
